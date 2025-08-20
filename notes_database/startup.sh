@@ -1,9 +1,11 @@
 #!/bin/bash
+set -euo pipefail
 
 DB_NAME="myapp"
 DB_USER="appuser"
 DB_PASSWORD="dbuser123"
 DB_PORT="5000"
+SCHEMA_FILE="$(dirname "$0")/schema.sql"
 
 echo "Starting MySQL setup..."
 
@@ -14,8 +16,19 @@ if sudo mysqladmin ping --socket=/var/run/mysqld/mysqld.sock --silent 2>/dev/nul
     # Try to verify the database exists
     if sudo mysql --socket=/var/run/mysqld/mysqld.sock -e "USE ${DB_NAME};" 2>/dev/null; then
         echo "Database ${DB_NAME} is accessible."
+        # Apply schema if available (idempotent)
+        if [ -f "${SCHEMA_FILE}" ]; then
+            echo "Applying schema.sql to ${DB_NAME} (idempotent)..."
+            sudo mysql --socket=/var/run/mysqld/mysqld.sock "${DB_NAME}" < "${SCHEMA_FILE}" || {
+                echo "Warning: Failed to apply schema via socket, will try TCP..."
+                mysql -u root -p"${DB_PASSWORD}" -h 127.0.0.1 -P "${DB_PORT}" "${DB_NAME}" < "${SCHEMA_FILE}" || true
+            }
+            echo "Schema applied (or already up to date)."
+        else
+            echo "schema.sql not found at ${SCHEMA_FILE}, skipping schema application."
+        fi
     fi
-    
+
     echo ""
     echo "Database: ${DB_NAME}"
     echo "Root user: root (password: ${DB_PASSWORD})"
@@ -45,6 +58,14 @@ if pgrep -f "mysqld.*--port=${DB_PORT}" > /dev/null 2>&1; then
     # Try to connect via TCP
     if mysql -u root -p${DB_PASSWORD} -h 127.0.0.1 -P ${DB_PORT} -e "SELECT 1;" 2>/dev/null; then
         echo "MySQL is accessible on port ${DB_PORT}."
+        # Apply schema if available (idempotent)
+        if [ -f "${SCHEMA_FILE}" ]; then
+            echo "Applying schema.sql to ${DB_NAME} (idempotent) over TCP..."
+            mysql -u root -p"${DB_PASSWORD}" -h 127.0.0.1 -P "${DB_PORT}" "${DB_NAME}" < "${SCHEMA_FILE}" || true
+            echo "Schema applied (or already up to date)."
+        else
+            echo "schema.sql not found at ${SCHEMA_FILE}, skipping schema application."
+        fi
         echo "Script stopped - server already running."
         exit 0
     fi
@@ -108,6 +129,38 @@ GRANT ALL PRIVILEGES ON ${DB_NAME}.* TO 'root'@'localhost';
 FLUSH PRIVILEGES;
 EOF
 
+# Apply schema file if present (idempotent)
+if [ -f "${SCHEMA_FILE}" ]; then
+    echo "Applying schema.sql to ${DB_NAME}..."
+    # compute checksum to detect changes between runs
+    SCHEMA_HASH_FILE=".schema.applied.checksum"
+    CURRENT_HASH="$(sha256sum "${SCHEMA_FILE}" | awk '{print $1}')"
+    PREV_HASH=""
+    if [ -f "${SCHEMA_HASH_FILE}" ]; then
+        PREV_HASH="$(cat "${SCHEMA_HASH_FILE}")"
+    fi
+
+    if [ "${CURRENT_HASH}" != "${PREV_HASH}" ]; then
+        # Try socket first, fallback to TCP
+        if sudo mysql --socket=/var/run/mysqld/mysqld.sock "${DB_NAME}" < "${SCHEMA_FILE}"; then
+            echo "${CURRENT_HASH}" > "${SCHEMA_HASH_FILE}"
+            echo "Schema applied successfully via socket."
+        else
+            echo "Socket application failed, retrying via TCP..."
+            if mysql -u root -p"${DB_PASSWORD}" -h 127.0.0.1 -P "${DB_PORT}" "${DB_NAME}" < "${SCHEMA_FILE}"; then
+                echo "${CURRENT_HASH}" > "${SCHEMA_HASH_FILE}"
+                echo "Schema applied successfully via TCP."
+            else
+                echo "Warning: Failed to apply schema via both methods. Continuing."
+            fi
+        fi
+    else
+        echo "Schema unchanged (checksum match). Skipping re-application."
+    fi
+else
+    echo "schema.sql not found at ${SCHEMA_FILE}, skipping schema application."
+fi
+
 # Save connection command to a file
 echo "mysql -u ${DB_USER} -p${DB_PASSWORD} -h localhost -P ${DB_PORT} ${DB_NAME}" > db_connection.txt
 echo "Connection command saved to db_connection.txt"
@@ -136,4 +189,5 @@ echo "$(cat db_connection.txt)"
 
 echo ""
 echo "MySQL is running in the background."
+echo "Database schema ensured up to date."
 echo "You can now start your application."
